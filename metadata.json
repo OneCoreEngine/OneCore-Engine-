@@ -1,0 +1,5 @@
+{
+  "name": "OneCore Engine (Educational)",
+  "description": "An educational cybersecurity research tool for learning Android reverse engineering, Unreal Engine memory structures, and anti-cheat mechanisms.",
+  "requestFramePermissions": []
+}
