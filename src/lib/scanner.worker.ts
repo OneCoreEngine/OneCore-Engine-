@@ -68,24 +68,31 @@ self.onmessage = async (e: MessageEvent) => {
       // Format to 6-7 digits as requested
       const rva = found ? `0x${offset.toString(16).toUpperCase()}` : '❌ Not Found';
 
-      matches.push({
+      const match = {
         name: p.name,
         rva,
         found,
         category: p.category,
         isClosestMatch
-      });
+      };
+      
+      matches.push(match);
+      // Send match progressively
+      self.postMessage({ type: 'match', match });
     }
 
     // Step 4: Extract Symbols
     elfInfo.symbols.forEach(sym => {
       if (sym.value > 0n) {
-        matches.push({
+        const match = {
           name: sym.name,
           rva: `0x${sym.value.toString(16).toUpperCase()}`,
           found: true,
           category: 'function'
-        });
+        };
+        matches.push(match);
+        // Send match progressively
+        self.postMessage({ type: 'match', match });
       }
     });
 
@@ -96,14 +103,41 @@ self.onmessage = async (e: MessageEvent) => {
       const rodata = new Uint8Array(rodataBuffer);
       const strings = extractGameStrings(rodata, 0, rodata.length);
       strings.forEach(s => {
-        matches.push({
+        const match = {
           name: s.name,
           rva: `0x${(rodataSection.offset + s.offset).toString(16).toUpperCase()}`,
           found: true,
           category: 'strings',
-          isString: true
-        });
+          isString: true,
+          type: 'NORMAL'
+        };
+        matches.push(match);
+        // Send match progressively
+        self.postMessage({ type: 'match', match });
       });
+    }
+
+    // Step 6: Extract Raw Offsets from .text (every 16 bytes for 50k+ results)
+    if (textSection) {
+      const step = 16;
+      const maxRaw = 50000;
+      let count = 0;
+      for (let start = 0; start < textSection.size && count < maxRaw; start += step) {
+        const rva = `0x${start.toString(16).toUpperCase()}`;
+        const match = {
+          name: `RAW_${rva}`,
+          rva,
+          found: true,
+          category: 'core',
+          type: 'RAW'
+        };
+        matches.push(match);
+        count++;
+        // Send raw match progressively every 100 to avoid message flooding
+        if (count % 100 === 0) {
+          self.postMessage({ type: 'match', match });
+        }
+      }
     }
 
     self.postMessage({ type: 'progress', progress: 100 });

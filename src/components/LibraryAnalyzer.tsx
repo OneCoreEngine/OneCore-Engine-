@@ -21,7 +21,10 @@ import {
 } from 'lucide-react';
 
 import FileUploader from './FileUploader';
+import OffsetList from './OffsetList';
 import { identifyBypassCandidates, BypassCandidate } from '../lib/bypassDetector';
+import { getBanFixInfo } from '../lib/banFixDetector';
+import { saveAsTxt } from '../lib/saveFile';
 
 interface ScanResult {
   fileName: string;
@@ -33,7 +36,7 @@ interface ScanResult {
     category: string;
     isString?: boolean;
     isClosestMatch?: boolean;
-    type?: 'PATCH' | 'HOOK' | 'NORMAL';
+    type?: 'PATCH' | 'HOOK' | 'NORMAL' | 'RAW';
   }[];
 }
 
@@ -48,6 +51,7 @@ export default function LibraryAnalyzer() {
   const [searchQuery, setSearchQuery] = useState('');
   const [activeCategories, setActiveCategories] = useState<Category[]>(['core', 'function', 'actor', 'anticheat', 'security', 'strings']);
   const [expandedResults, setExpandedResults] = useState<number[]>([]);
+  const [selectedOffsets, setSelectedOffsets] = useState<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const workerRef = useRef<Worker | null>(null);
 
@@ -89,20 +93,47 @@ export default function LibraryAnalyzer() {
     setIsScanning(true);
     setError(null);
     setProgress(0);
-    const newResults: ScanResult[] = [];
+    setResults([]); // Clear previous results
+    setSelectedOffsets(new Set());
 
     try {
-      for (const file of files) {
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
         // Initialize Web Worker
         const worker = new Worker(new URL('../lib/scanner.worker.ts', import.meta.url), { type: 'module' });
         workerRef.current = worker;
 
-        const resultPromise = new Promise<any[]>((resolve, reject) => {
+        // Create initial result entry for progressive updates
+        setResults(prev => [...prev, {
+          fileName: file.name,
+          fileSize: file.size,
+          matches: []
+        }]);
+        setExpandedResults(prev => [...prev, i]);
+
+        const resultPromise = new Promise<void>((resolve, reject) => {
           worker.onmessage = (e) => {
             if (e.data.type === 'progress') {
               setProgress(e.data.progress);
+            } else if (e.data.type === 'match') {
+              const match = e.data.match;
+              const bypassCandidates = identifyBypassCandidates([match]);
+              const enrichedMatch = {
+                ...match,
+                type: match.type === 'RAW' ? 'RAW' : (bypassCandidates[0]?.type || 'NORMAL')
+              };
+
+              setResults(prev => {
+                const newResults = [...prev];
+                const currentResult = newResults[i];
+                if (currentResult) {
+                  currentResult.matches = [...currentResult.matches, enrichedMatch];
+                }
+                return newResults;
+              });
             } else if (e.data.type === 'result') {
-              resolve(e.data.matches);
+              // Final result received, though we've been updating progressively
+              resolve();
             } else if (e.data.type === 'error') {
               reject(new Error(e.data.message));
             }
@@ -111,33 +142,13 @@ export default function LibraryAnalyzer() {
         });
 
         // Pass the file object directly to the worker
-        // The worker will read it in chunks or as a whole
-        // For 400MB support, we should ideally read it in chunks in the worker
         worker.postMessage({ file, fileName: file.name });
 
-        const matches = await resultPromise;
-        const bypassCandidates = identifyBypassCandidates(matches);
-        
-        // Merge bypass info into matches
-        const enrichedMatches = matches.map(m => {
-          const candidate = bypassCandidates.find(c => c.name === m.name);
-          return {
-            ...m,
-            type: candidate?.type || 'NORMAL'
-          };
-        });
-
-        newResults.push({
-          fileName: file.name,
-          fileSize: file.size,
-          matches: enrichedMatches
-        });
+        await resultPromise;
         
         worker.terminate();
         workerRef.current = null;
       }
-      setResults(newResults);
-      setExpandedResults(newResults.map((_, i) => i));
     } catch (err) {
       if (err instanceof Error && err.name === 'AbortError') {
         setError('Analysis cancelled by user');
@@ -182,8 +193,23 @@ export default function LibraryAnalyzer() {
     let report = `// OneCore v2.0 - BGMI OFFSETS REPORT\n`;
     report += `// Generated: ${new Date().toLocaleString()}\n\n`;
 
+    // =========================================
+    // BAN FIX OFFSETS (COPY THESE FIRST)
+    // =========================================
+    const banFixMatches = res.matches.filter(m => getBanFixInfo(m.name).isBanFix && m.found);
+    if (banFixMatches.length > 0) {
+      report += `// =========================================\n`;
+      report += `// BAN FIX OFFSETS (COPY THESE FIRST)\n`;
+      report += `// =========================================\n`;
+      banFixMatches.forEach(m => {
+        const banInfo = getBanFixInfo(m.name);
+        report += `${m.rva}  // ${banInfo.label} (${m.name})\n`;
+      });
+      report += `\n`;
+    }
+
     // ===== BYPASS OFFSETS (NOP THESE) =====
-    const patchMatches = res.matches.filter(m => m.type === 'PATCH' && m.found);
+    const patchMatches = res.matches.filter(m => m.type === 'PATCH' && m.found && !getBanFixInfo(m.name).isBanFix);
     if (patchMatches.length > 0) {
       report += `// ===== BYPASS OFFSETS (NOP THESE) =====\n`;
       patchMatches.forEach(m => {
@@ -202,11 +228,13 @@ export default function LibraryAnalyzer() {
       report += `\n`;
     }
 
-    // ===== NORMAL OFFSETS =====
-    report += `// ===== NORMAL OFFSETS =====\n`;
+    // ===== ALL OFFSETS =====
+    report += `// =========================================\n`;
+    report += `// ALL OFFSETS\n`;
+    report += `// =========================================\n`;
     const categories: Category[] = ['core', 'function', 'actor', 'anticheat', 'security', 'strings'];
     categories.forEach(cat => {
-      const catMatches = res.matches.filter(m => m.category === cat && m.found && m.type === 'NORMAL');
+      const catMatches = res.matches.filter(m => m.category === cat && m.found && m.type === 'NORMAL' && !getBanFixInfo(m.name).isBanFix);
       if (catMatches.length > 0) {
         catMatches.forEach(m => {
           report += `${m.name} = ${m.rva}\n`;
@@ -231,9 +259,44 @@ export default function LibraryAnalyzer() {
     );
   };
 
+  const toggleOffsetSelection = (name: string) => {
+    setSelectedOffsets(prev => {
+      const next = new Set(prev);
+      if (next.has(name)) {
+        next.delete(name);
+      } else {
+        next.add(name);
+      }
+      return next;
+    });
+  };
+
+  const copySelectedOffsets = () => {
+    if (selectedOffsets.size === 0) return;
+    const text = results.flatMap(res => 
+      res.matches.filter(m => selectedOffsets.has(m.name))
+        .map(m => `${m.name} = ${m.rva}`)
+    ).join('\n');
+    copyToClipboard(text);
+  };
+
+  const saveSelectedOffsets = () => {
+    if (selectedOffsets.size === 0) return;
+    const text = results.flatMap(res => 
+      res.matches.filter(m => selectedOffsets.has(m.name))
+        .map(m => `${m.name} = ${m.rva}`)
+    ).join('\n');
+    saveAsTxt(text, 'bgmi_offsets.txt');
+  };
+
+  const copyAllOffsets = (res: ScanResult) => {
+    const text = res.matches.filter(m => m.found).map(m => `${m.name} = ${m.rva}`).join('\n');
+    copyToClipboard(text);
+  };
+
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
-    alert('Report copied to clipboard!');
+    alert('Copied to clipboard!');
   };
 
   return (
@@ -376,35 +439,83 @@ export default function LibraryAnalyzer() {
               </div>
               
               {expandedResults.includes(i) && (
-                <div className="p-6 space-y-6">
-                  {/* Matches List */}
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    {result.matches.map((match, mi) => (
-                      <div key={mi} className="bg-zinc-950 p-4 rounded-xl border border-zinc-800 flex items-center justify-between group hover:border-[#00ff88]/30 transition-all">
-                        <div className="flex items-center gap-3">
-                          <div className={`p-2 rounded-lg ${match.isString ? 'bg-purple-500/10 text-purple-400' : 'bg-[#00ff88]/10 text-[#00ff88]'}`}>
-                            {match.isString ? <Type size={14} /> : <Hash size={14} />}
-                          </div>
-                          <div className="flex flex-col gap-1">
-                            <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest flex items-center gap-2">
-                              {highlightText(match.name, searchQuery)}
-                              {match.isClosestMatch && <span className="text-[8px] bg-yellow-500/20 text-yellow-500 px-1 rounded">CLOSEST</span>}
-                              {match.type === 'PATCH' && <span className="text-[8px] bg-red-500/20 text-red-500 px-1 rounded font-bold">PATCH</span>}
-                              {match.type === 'HOOK' && <span className="text-[8px] bg-blue-500/20 text-blue-500 px-1 rounded font-bold">HOOK</span>}
-                            </span>
-                            <span className={`text-sm font-mono ${match.found ? 'text-[#00ff88]' : 'text-red-500'}`}>
-                              {highlightText(match.rva, searchQuery)}
-                            </span>
-                          </div>
-                        </div>
-                        <div className={`px-2 py-1 rounded text-[8px] font-bold uppercase ${
-                          match.category === 'anticheat' || match.category === 'security' ? 'bg-red-500/10 text-red-400' : 'bg-blue-500/10 text-blue-400'
-                        }`}>
-                          {highlightText(match.category, searchQuery)}
-                        </div>
-                      </div>
-                    ))}
+                <div className="p-4 md:p-6 space-y-6">
+                  {/* Selection Controls */}
+                  <div className="flex flex-col gap-4 bg-zinc-950 p-4 rounded-xl border border-zinc-800">
+                    <div className="flex flex-wrap items-center gap-4">
+                      <button 
+                        onClick={() => {
+                          const namedNames = result.matches.filter(m => m.type !== 'RAW').map(m => m.name);
+                          setSelectedOffsets(prev => {
+                            const next = new Set(prev);
+                            namedNames.forEach(n => next.add(n));
+                            return next;
+                          });
+                        }}
+                        className="text-[10px] font-bold text-[#00ff88] hover:underline uppercase tracking-widest min-h-[44px] flex items-center"
+                      >
+                        Select All Named
+                      </button>
+                      <button 
+                        onClick={() => {
+                          const rawNames = result.matches.filter(m => m.type === 'RAW').map(m => m.name);
+                          setSelectedOffsets(prev => {
+                            const next = new Set(prev);
+                            rawNames.forEach(n => next.add(n));
+                            return next;
+                          });
+                        }}
+                        className="text-[10px] font-bold text-[#00ff88] hover:underline uppercase tracking-widest min-h-[44px] flex items-center"
+                      >
+                        Select All Raw
+                      </button>
+                      <button 
+                        onClick={() => {
+                          const allNames = result.matches.map(m => m.name);
+                          setSelectedOffsets(prev => {
+                            const next = new Set(prev);
+                            allNames.forEach(n => next.delete(n));
+                            return next;
+                          });
+                        }}
+                        className="text-[10px] font-bold text-zinc-500 hover:underline uppercase tracking-widest min-h-[44px] flex items-center"
+                      >
+                        Deselect All
+                      </button>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button 
+                        onClick={copySelectedOffsets}
+                        disabled={selectedOffsets.size === 0}
+                        className="flex-1 px-4 py-3 rounded-lg bg-[#00ff88]/10 text-[#00ff88] border border-[#00ff88]/20 text-[10px] font-bold uppercase tracking-widest hover:bg-[#00ff88]/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px]"
+                      >
+                        Copy Selected ({Array.from(selectedOffsets).filter(n => result.matches.some(m => m.name === n)).length})
+                      </button>
+                      <button 
+                        onClick={saveSelectedOffsets}
+                        disabled={selectedOffsets.size === 0}
+                        className="flex-1 px-4 py-3 rounded-lg bg-[#00ff88] text-black text-[10px] font-bold uppercase tracking-widest hover:bg-[#00ff88]/90 transition-all disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px]"
+                      >
+                        Save Selected
+                      </button>
+                      <button 
+                        onClick={() => copyAllOffsets(result)}
+                        className="flex-1 px-4 py-3 rounded-lg bg-zinc-800 text-zinc-300 border border-zinc-700 text-[10px] font-bold uppercase tracking-widest hover:bg-zinc-700 transition-all min-h-[44px]"
+                      >
+                        Copy All
+                      </button>
+                    </div>
                   </div>
+
+                  {/* Matches List */}
+                  <OffsetList 
+                    matches={result.matches}
+                    selectedOffsets={selectedOffsets}
+                    onToggleSelect={toggleOffsetSelection}
+                    onCopy={copyToClipboard}
+                    searchQuery={searchQuery}
+                    highlightText={highlightText}
+                  />
 
                   {/* Code Preview */}
                   <div className="space-y-2">
